@@ -1,25 +1,24 @@
 /**
- * Memory overhead benchmark for AgentOS WASM VMs.
+ * Memory overhead benchmark for AgentOS VMs.
  *
- * Measures incremental RSS and heap per live VM instance by spinning up
- * N VMs each running a workload, sampling memory, then tearing them down.
+ * Staircase approach: warms up caches with a throwaway VM, then adds VMs
+ * one at a time, measuring the incremental RSS and heap after each step.
+ * The per-VM cost is the average step delta — free of one-time setup noise.
  *
  * Workloads:
  *   --workload=sleep  (default) Minimal VM with coreutils, running `sleep 99999`
- *   --workload=pi     Full VM with common + PI agent in RPC mode
+ *   --workload=pi     VM with PI agent session via createSession
  *
- * Pass --batch=N for a single batch size (recommended for clean RSS).
- * Without --batch, runs default batch sizes sequentially.
+ * Pass --count=N to control how many VMs to add (default 5).
  *
  * Usage:
  *   npx tsx --expose-gc benchmarks/memory.bench.ts
- *   npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi --batch=5
+ *   npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi --count=1
  */
 
 import type { AgentOs } from "@rivet-dev/agent-os-core";
+import { readFileSync, readdirSync } from "node:fs";
 import {
-	MAX_CONCURRENCY,
-	MEMORY_ITERATIONS,
 	WORKLOADS,
 	type Workload,
 	forceGC,
@@ -28,137 +27,162 @@ import {
 	printTable,
 	round,
 	sleep,
+	stopLlmock,
 } from "./bench-utils.js";
 
-// Default batch sizes when not using --batch.
-const DEFAULT_BATCH_SIZES = [1, 10, 50, 100];
+const DEFAULT_COUNT = 5;
+const PAGE_SIZE = 4096; // Linux default
 
-interface MemoryEntry {
-	batchSize: number;
-	iterations: number;
-	workload: string;
-	/** First iteration (cold module cache). */
-	coldPerVmRssBytes: number;
-	coldPerVmHeapBytes: number;
-	/** Average of subsequent iterations (warm module cache). */
-	warmPerVmRssBytes: number;
-	warmPerVmHeapBytes: number;
-	/** Average across all iterations. */
-	totalDeltaRssBytes: number;
-	totalDeltaHeapBytes: number;
-	perVmRssBytes: number;
-	perVmHeapBytes: number;
-	teardownReclaimedRssBytes: number;
+interface StepSample {
+	stepIndex: number;
+	rssBytes: number;
+	heapBytes: number;
 }
 
-async function measureBatch(
-	workload: Workload,
-	batchSize: number,
-): Promise<MemoryEntry> {
-	const rssSamples: number[] = [];
-	const heapSamples: number[] = [];
-	const reclaimSamples: number[] = [];
+interface MemoryResult {
+	workload: string;
+	count: number;
+	/** Per-step incremental measurements. */
+	steps: StepSample[];
+	/** Average incremental RSS per VM (bytes). */
+	avgPerVmRssBytes: number;
+	/** Average incremental heap per VM (bytes). */
+	avgPerVmHeapBytes: number;
+	/** RSS reclaimed after disposing all VMs (bytes). */
+	reclaimedRssBytes: number;
+}
 
-	for (let iter = 0; iter < MEMORY_ITERATIONS; iter++) {
-		// Baseline. Multiple GC passes to flush incremental/concurrent phases.
-		forceGC();
-		forceGC();
-		await sleep(100);
-		const baseline = process.memoryUsage();
+/**
+ * Read RSS for a single PID from /proc/[pid]/statm.
+ * Returns bytes. Returns 0 if the process no longer exists.
+ */
+function pidRssBytes(pid: number): number {
+	try {
+		const statm = readFileSync(`/proc/${pid}/statm`, "utf8");
+		const rssPages = parseInt(statm.split(" ")[1], 10);
+		return rssPages * PAGE_SIZE;
+	} catch {
+		return 0;
+	}
+}
 
-		// Create VMs and start the workload in each.
-		const vms: AgentOs[] = [];
-		let remaining = batchSize;
+/**
+ * Sum RSS across the host process and all descendant processes.
+ * The V8 isolate runs as a separate child process (Rust binary), so
+ * process.memoryUsage().rss only captures the host + WASM Worker threads.
+ * This reads /proc to include the full process tree.
+ */
+function processTreeRssBytes(): number {
+	const hostPid = process.pid;
+	let total = pidRssBytes(hostPid);
 
-		while (remaining > 0) {
-			const chunk = Math.min(remaining, MAX_CONCURRENCY);
-			const batch = await Promise.all(
-				Array.from({ length: chunk }, async () => {
-					const vm = await workload.createVm();
-					workload.start(vm);
-					return vm;
-				}),
-			);
-			vms.push(...batch);
-			remaining -= chunk;
+	// Walk /proc to find children (and their children, etc.)
+	const visited = new Set<number>([hostPid]);
+	const queue = [hostPid];
+
+	while (queue.length > 0) {
+		const parentPid = queue.pop()!;
+		try {
+			const children = readFileSync(
+				`/proc/${parentPid}/task/${parentPid}/children`,
+				"utf8",
+			).trim();
+			if (!children) continue;
+			for (const token of children.split(/\s+/)) {
+				const childPid = parseInt(token, 10);
+				if (!isNaN(childPid) && !visited.has(childPid)) {
+					visited.add(childPid);
+					total += pidRssBytes(childPid);
+					queue.push(childPid);
+				}
+			}
+		} catch {
+			// /proc entry may have vanished
 		}
-
-		// Let processes fully initialize.
-		await sleep(workload.settleMs);
-
-		// Measure after init.
-		forceGC();
-		forceGC();
-		await sleep(100);
-		const afterInit = process.memoryUsage();
-
-		const rssDelta = afterInit.rss - baseline.rss;
-		const heapDelta = afterInit.heapUsed - baseline.heapUsed;
-
-		console.error(
-			`    iter ${iter}: rss_delta=${formatBytes(rssDelta)} heap_delta=${formatBytes(heapDelta)}`,
-		);
-		rssSamples.push(rssDelta);
-		heapSamples.push(heapDelta);
-
-		// Teardown.
-		await Promise.all(vms.map((vm) => vm.dispose()));
-		forceGC();
-		forceGC();
-		await sleep(100);
-		const afterTeardown = process.memoryUsage();
-
-		reclaimSamples.push(afterInit.rss - afterTeardown.rss);
 	}
 
-	// Split cold (first iteration) vs warm (subsequent iterations).
-	const coldRss = rssSamples[0];
-	const coldHeap = heapSamples[0];
-	const warmRssSamples = rssSamples.slice(1);
-	const warmHeapSamples = heapSamples.slice(1);
-	const warmRss =
-		warmRssSamples.length > 0
-			? warmRssSamples.reduce((a, b) => a + b, 0) / warmRssSamples.length
-			: coldRss;
-	const warmHeap =
-		warmHeapSamples.length > 0
-			? warmHeapSamples.reduce((a, b) => a + b, 0) / warmHeapSamples.length
-			: coldHeap;
+	return total;
+}
 
-	// Average across all iterations.
-	const avgRss = rssSamples.reduce((a, b) => a + b, 0) / MEMORY_ITERATIONS;
-	const avgHeap = heapSamples.reduce((a, b) => a + b, 0) / MEMORY_ITERATIONS;
-	const avgReclaim =
-		reclaimSamples.reduce((a, b) => a + b, 0) / MEMORY_ITERATIONS;
+async function sampleMemory(): Promise<{ rss: number; heap: number }> {
+	forceGC();
+	forceGC();
+	await sleep(100);
+	return { rss: processTreeRssBytes(), heap: process.memoryUsage().heapUsed };
+}
+
+async function measure(
+	workload: Workload,
+	count: number,
+): Promise<MemoryResult> {
+	// Warmup: create and destroy one VM to pay one-time costs (module cache, JIT, etc.)
+	console.error("  warming up...");
+	const warmupVm = await workload.createVm();
+	await workload.start(warmupVm);
+	await sleep(workload.settleMs);
+	await warmupVm.dispose();
+	forceGC();
+	forceGC();
+	await sleep(200);
+
+	// Staircase: add VMs one at a time, measure after each.
+	const vms: AgentOs[] = [];
+	const steps: StepSample[] = [];
+
+	let prev = await sampleMemory();
+
+	for (let i = 0; i < count; i++) {
+		const vm = await workload.createVm();
+		await workload.start(vm);
+		vms.push(vm);
+
+		await sleep(workload.settleMs);
+		workload.verify(vm);
+		const cur = await sampleMemory();
+
+		const rssDelta = cur.rss - prev.rss;
+		const heapDelta = cur.heap - prev.heap;
+		steps.push({ stepIndex: i, rssBytes: rssDelta, heapBytes: heapDelta });
+
+		console.error(
+			`    step ${i}: rss=${formatBytes(rssDelta)} heap=${formatBytes(heapDelta)}`,
+		);
+		prev = cur;
+	}
+
+	// Measure reclaim.
+	const beforeTeardown = await sampleMemory();
+	await Promise.all(vms.map((vm) => vm.dispose()));
+	const afterTeardown = await sampleMemory();
+	const reclaimed = beforeTeardown.rss - afterTeardown.rss;
+
+	const avgRss =
+		steps.reduce((a, s) => a + s.rssBytes, 0) / steps.length;
+	const avgHeap =
+		steps.reduce((a, s) => a + s.heapBytes, 0) / steps.length;
 
 	return {
-		batchSize,
-		iterations: MEMORY_ITERATIONS,
 		workload: workload.name,
-		coldPerVmRssBytes: Math.round(coldRss / batchSize),
-		coldPerVmHeapBytes: Math.round(coldHeap / batchSize),
-		warmPerVmRssBytes: Math.round(warmRss / batchSize),
-		warmPerVmHeapBytes: Math.round(warmHeap / batchSize),
-		totalDeltaRssBytes: Math.round(avgRss),
-		totalDeltaHeapBytes: Math.round(avgHeap),
-		perVmRssBytes: Math.round(avgRss / batchSize),
-		perVmHeapBytes: Math.round(avgHeap / batchSize),
-		teardownReclaimedRssBytes: Math.round(avgReclaim),
+		count,
+		steps,
+		avgPerVmRssBytes: Math.round(avgRss),
+		avgPerVmHeapBytes: Math.round(avgHeap),
+		reclaimedRssBytes: Math.round(reclaimed),
 	};
 }
 
-function parseArgs(): { batchSizes: number[]; workload: Workload } {
-	const batchArg = process.argv.find((a) => a.startsWith("--batch="));
+function parseArgs(): { count: number; workload: Workload } {
+	const countArg = process.argv.find((a) => a.startsWith("--count="));
 	const workloadArg = process.argv.find((a) => a.startsWith("--workload="));
 
-	let batchSizes = DEFAULT_BATCH_SIZES;
-	if (batchArg) {
-		const val = parseInt(batchArg.split("=")[1], 10);
+	let count = DEFAULT_COUNT;
+	if (countArg) {
+		const val = parseInt(countArg.split("=")[1], 10);
 		if (isNaN(val) || val < 1) {
-			console.error(`Invalid --batch value: ${batchArg}`);
+			console.error(`Invalid --count value: ${countArg}`);
 			process.exit(1);
 		}
-		batchSizes = [val];
+		count = val;
 	}
 
 	let workload = WORKLOADS.sleep;
@@ -173,7 +197,7 @@ function parseArgs(): { batchSizes: number[]; workload: Workload } {
 		workload = WORKLOADS[name];
 	}
 
-	return { batchSizes, workload };
+	return { count, workload };
 }
 
 async function main() {
@@ -185,56 +209,35 @@ async function main() {
 		process.exit(1);
 	}
 
-	const { batchSizes, workload } = parseArgs();
+	const { count, workload } = parseArgs();
 	const hardware = getHardware();
 	console.error(`=== Memory Overhead Benchmark ===`);
 	console.error(`Workload: ${workload.name} — ${workload.description}`);
 	console.error(`CPU: ${hardware.cpu}`);
 	console.error(`RAM: ${hardware.ram} | Node: ${hardware.node}`);
-	console.error(`Iterations per batch: ${MEMORY_ITERATIONS}`);
-	console.error(`Batch sizes: ${batchSizes.join(", ")}`);
+	console.error(`Count: ${count} VMs\n`);
 
-	const results: MemoryEntry[] = [];
+	const result = await measure(workload, count);
 
-	for (const batchSize of batchSizes) {
-		console.error(`\n--- batch=${batchSize} ---`);
-		const entry = await measureBatch(workload, batchSize);
-		results.push(entry);
-		console.error(
-			`  cold per-VM RSS: ${formatBytes(entry.coldPerVmRssBytes)} | heap: ${formatBytes(entry.coldPerVmHeapBytes)}`,
-		);
-		console.error(
-			`  warm per-VM RSS: ${formatBytes(entry.warmPerVmRssBytes)} | heap: ${formatBytes(entry.warmPerVmHeapBytes)}`,
-		);
-		console.error(
-			`  teardown reclaimed: ${formatBytes(entry.teardownReclaimedRssBytes)}`,
-		);
-	}
+	console.error(
+		`\n  avg per-VM RSS: ${formatBytes(result.avgPerVmRssBytes)} | heap: ${formatBytes(result.avgPerVmHeapBytes)}`,
+	);
+	console.error(`  reclaimed: ${formatBytes(result.reclaimedRssBytes)}`);
 
 	// Summary table.
 	printTable(
-		[
-			"workload",
-			"batch",
-			"cold RSS/VM",
-			"cold heap/VM",
-			"warm RSS/VM",
-			"warm heap/VM",
-			"reclaimed",
-		],
-		results.map((r) => [
-			r.workload,
-			r.batchSize,
-			formatBytes(r.coldPerVmRssBytes),
-			formatBytes(r.coldPerVmHeapBytes),
-			formatBytes(r.warmPerVmRssBytes),
-			formatBytes(r.warmPerVmHeapBytes),
-			formatBytes(r.teardownReclaimedRssBytes),
+		["step", "RSS delta", "heap delta"],
+		result.steps.map((s) => [
+			s.stepIndex,
+			formatBytes(s.rssBytes),
+			formatBytes(s.heapBytes),
 		]),
 	);
 
 	// JSON to stdout.
-	console.log(JSON.stringify({ hardware, workload: workload.name, results }, null, 2));
+	console.log(JSON.stringify({ hardware, result }, null, 2));
+
+	await stopLlmock();
 }
 
 main().catch((err) => {

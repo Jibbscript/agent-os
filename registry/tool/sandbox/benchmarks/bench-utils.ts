@@ -1,6 +1,7 @@
 import { AgentOs } from "@rivet-dev/agent-os-core";
-import common, { coreutils } from "@rivet-dev/agent-os-common";
+import { coreutils } from "@rivet-dev/agent-os-common";
 import pi from "@rivet-dev/agent-os-pi";
+import { LLMock } from "@copilotkit/llmock";
 import os from "node:os";
 
 // Benchmark parameters. Keep batch sizes minimal for fast iteration.
@@ -9,9 +10,39 @@ export const ITERATIONS = 5;
 export const WARMUP_ITERATIONS = 1;
 export const MAX_CONCURRENCY = Math.max(1, os.availableParallelism() - 4);
 
-export const MEMORY_ITERATIONS = 3;
 export const ECHO_COMMAND = "echo hello";
 export const EXPECTED_OUTPUT = "hello\n";
+
+// ── Shared mock LLM server ─────────────────────────────────────────
+
+let _llmock: LLMock | undefined;
+let _llmockUrl: string | undefined;
+let _llmockPort: number | undefined;
+
+/** Start a shared llmock server (idempotent). */
+export async function ensureLlmock(): Promise<{
+	url: string;
+	port: number;
+}> {
+	if (_llmock) return { url: _llmockUrl!, port: _llmockPort! };
+	_llmock = new LLMock({ port: 0, logLevel: "silent" });
+	_llmock.addFixtures([
+		{ match: { predicate: () => true }, response: { content: "ok" } },
+	]);
+	_llmockUrl = await _llmock.start();
+	_llmockPort = Number(new URL(_llmockUrl).port);
+	return { url: _llmockUrl, port: _llmockPort };
+}
+
+/** Stop the shared llmock server. */
+export async function stopLlmock(): Promise<void> {
+	if (_llmock) {
+		await _llmock.stop();
+		_llmock = undefined;
+		_llmockUrl = undefined;
+		_llmockPort = undefined;
+	}
+}
 
 // ── Workload abstraction ────────────────────────────────────────────
 
@@ -21,7 +52,9 @@ export interface Workload {
 	description: string;
 	createVm: () => Promise<AgentOs>;
 	/** Start a long-running process so the Worker thread stays alive. */
-	start: (vm: AgentOs) => void;
+	start: (vm: AgentOs) => Promise<void> | void;
+	/** Verify the expected processes are running. Throws if not. */
+	verify: (vm: AgentOs) => void;
 	/** Time to wait after start for the process to fully initialize. */
 	settleMs: number;
 }
@@ -34,19 +67,59 @@ export const WORKLOADS: Record<string, Workload> = {
 		start: (vm) => {
 			vm.spawn("sleep", ["99999"]);
 		},
+		verify: (vm) => {
+			const procs = vm.listProcesses();
+			const running = procs.filter((p) => p.running);
+			const hasSleep = running.some((p) => p.command === "sleep");
+			if (!hasSleep) {
+				throw new Error(
+					`Expected running 'sleep' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
+				);
+			}
+		},
 		settleMs: 500,
 	},
-	"pi-sdk": {
-		name: "pi-sdk",
+	node: {
+		name: "node",
+		description: "VM with an idle Node.js process (setTimeout keepalive)",
+		createVm: () => AgentOs.create({ software: [coreutils] }),
+		start: (vm) => {
+			vm.spawn("node", ["-e", "setTimeout(() => {}, 999999999)"], {
+				streamStdin: true,
+			});
+		},
+		verify: (vm) => {
+			const procs = vm.listProcesses();
+			const running = procs.filter((p) => p.running);
+			const hasNode = running.some((p) => p.command === "node");
+			if (!hasNode) {
+				throw new Error(
+					`Expected running 'node' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
+				);
+			}
+			const kernelProcs = vm.allProcesses();
+			const v8Proc = kernelProcs.find(
+				(p) => p.driver === "node" && p.status === "running",
+			);
+			if (!v8Proc) {
+				throw new Error(
+					`Expected V8 isolate running, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, status: p.status })))}`,
+				);
+			}
+		},
+		settleMs: 2000,
+	},
+	"pi-import": {
+		name: "pi-import",
 		description:
-			"VM with common + full PI SDK loaded via dynamic import",
-		createVm: () => AgentOs.create({ software: [common, pi] }),
+			"VM with Node.js process that imports the PI SDK and idles",
+		createVm: () => AgentOs.create({ software: [pi] }),
 		start: (vm) => {
 			vm.spawn(
 				"node",
 				[
 					"-e",
-					'import("/root/node_modules/@mariozechner/pi-coding-agent/dist/index.js").then(() => console.log("PI SDK loaded")).catch(e => console.error("PI SDK failed:", e.message)); setTimeout(() => {}, 999999);',
+					'import("@mariozechner/pi-coding-agent").then(() => console.log("loaded")).catch(e => console.error(e.message)); setTimeout(() => {}, 999999999);',
 				],
 				{
 					streamStdin: true,
@@ -54,7 +127,77 @@ export const WORKLOADS: Record<string, Workload> = {
 				},
 			);
 		},
+		verify: (vm) => {
+			const procs = vm.listProcesses();
+			const running = procs.filter((p) => p.running);
+			const hasNode = running.some((p) => p.command === "node");
+			if (!hasNode) {
+				throw new Error(
+					`Expected running 'node' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
+				);
+			}
+			const kernelProcs = vm.allProcesses();
+			const v8Proc = kernelProcs.find(
+				(p) => p.driver === "node" && p.status === "running",
+			);
+			if (!v8Proc) {
+				throw new Error(
+					`Expected V8 isolate running, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, status: p.status })))}`,
+				);
+			}
+		},
 		settleMs: 5000,
+	},
+	pi: {
+		name: "pi",
+		description: "VM with PI agent session via createSession",
+		createVm: async () => {
+			const { port } = await ensureLlmock();
+			return AgentOs.create({
+				software: [pi],
+				loopbackExemptPorts: [port],
+			});
+		},
+		start: async (vm) => {
+			const { url } = await ensureLlmock();
+			await vm.createSession("pi", {
+				env: {
+					ANTHROPIC_API_KEY: "bench-key",
+					ANTHROPIC_BASE_URL: url,
+				},
+			});
+		},
+		verify: (vm) => {
+			// listProcesses() checks the high-level spawn table.
+			const procs = vm.listProcesses();
+			const running = procs.filter((p) => p.running);
+			const hasPiAcp = running.some(
+				(p) =>
+					p.command === "node" &&
+					p.args.some((a) => a.includes("pi-acp")),
+			);
+			if (!hasPiAcp) {
+				throw new Error(
+					`Expected running pi-acp process, got: ${JSON.stringify(running.map((p) => ({ cmd: p.command, args: p.args })))}`,
+				);
+			}
+
+			// allProcesses() checks the kernel process table across all runtimes.
+			// Verify the V8 isolate (node driver) is running the ACP adapter.
+			const kernelProcs = vm.allProcesses();
+			const v8Proc = kernelProcs.find(
+				(p) =>
+					p.driver === "node" &&
+					p.status === "running" &&
+					p.args.some((a) => a.includes("pi-acp")),
+			);
+			if (!v8Proc) {
+				throw new Error(
+					`Expected V8 isolate running pi-acp, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, cmd: p.command, status: p.status })))}`,
+				);
+			}
+		},
+		settleMs: 2000,
 	},
 };
 

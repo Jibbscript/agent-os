@@ -27,6 +27,7 @@
 		"zod": "^3.25.0"
 	},
 	"devDependencies": {
+		"@copilotkit/llmock": "^1.6.0",
 		"@rivet-dev/agent-os-common": "link:../../software/common",
 		"@rivet-dev/agent-os-pi": "link:../../agent/pi",
 		"@types/node": "^22.10.2",

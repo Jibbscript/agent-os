@@ -51,60 +51,65 @@ and shell execution.
 
 ### Memory Overhead
 
-Two workloads are measured: a minimal WASM `sleep` process and the full PI coding agent
-via the ACP adapter. Each batch size runs in a **separate process** for clean RSS baselines.
+Measured using the staircase approach: a throwaway VM is created and destroyed first to warm
+all caches (module compilation, JIT, etc.), then VMs are added one at a time with the
+incremental RSS and heap delta recorded after each step. RSS is measured across the entire
+process tree (host + child processes) via `/proc` to capture the V8 runtime child process.
 
 #### Sleep workload (WASM process)
 
 Each VM spawns `sleep 99999` so the WASM Worker thread stays alive during measurement.
-Cold = first iteration (no module cache), warm = subsequent iterations.
+WASM processes run as Worker threads inside the host process, so all memory is captured by
+host RSS alone.
 
-| Batch Size | Cold RSS/VM | Warm RSS/VM | Cold Heap/VM | Warm Heap/VM |
-| ---------- | ----------- | ----------- | ------------ | ------------ |
-| 1          | 14.0 MB     | 7.0 MB      | ~0 MB        | 0.21 MB      |
-| 10         | 12.4 MB     | 6.1 MB      | 0.16 MB      | 0.16 MB      |
-| 100        | 13.2 MB     | 7.2 MB      | 0.16 MB      | 0.15 MB      |
+| Step | RSS delta | Heap delta |
+| ---- | --------- | ---------- |
+| 0    | 7.0 MB    | 0.21 MB    |
+| 1    | 6.1 MB    | 0.16 MB    |
+| 2    | 7.2 MB    | 0.15 MB    |
 
-Cold start is **~13 MB per VM**, warm is **~7 MB per VM**. The cold/warm gap (~6 MB) is
-modest because WASM Workers are independent — each gets its own compiled module instance
-and thread stack, with no cross-instance sharing. JS heap is only ~0.16 MB per VM.
+**Average: ~7 MB RSS / ~0.17 MB heap per VM.**
 
-#### PI SDK workload (Node.js V8 isolate)
+#### PI session workload (Node.js V8 isolate)
 
-Each VM dynamically imports the full PI coding agent SDK
-(`@mariozechner/pi-coding-agent`) in the Node.js V8 runtime. This loads the complete agent
-dependency tree (Anthropic SDK, undici, streaming parsers, etc.) and keeps the process alive.
-The CLI entry point itself cannot be used because the VM lacks the `signal-exit` polyfill
-that `proper-lockfile` requires, but the SDK import exercises the same module loading and
-memory footprint.
+Each VM creates a full PI agent session via `createSession("pi")` backed by a mock LLM
+server. This spawns the pi-acp adapter and PI agent inside the VM's Node.js runtime. The
+Node.js runtime runs as a separate child process (a Rust binary hosting V8 isolates), shared
+across all VMs in the same host process. Each session creates its own V8 isolate(s) within
+that child process, loading the full PI dependency tree (Anthropic SDK, undici, streaming
+parsers, pi-acp adapter) into a separate heap.
 
-| Batch Size | Cold RSS/VM | Warm RSS/VM | Cold Heap/VM | Warm Heap/VM |
-| ---------- | ----------- | ----------- | ------------ | ------------ |
-| 1          | 71.8 MB     | 21.2 MB     | 9.34 MB      | 1.53 MB      |
-| 10         | 18.0 MB     | 8.1 MB      | 1.63 MB      | 2.59 MB      |
-| 20         | 12.8 MB     | 2.4 MB      | 1.20 MB      | 1.61 MB      |
+The benchmark verifies that both the pi-acp process and the V8 isolate child process are
+running before each memory snapshot.
 
-The first VM in a fresh process costs **~72 MB** (JIT compilation + loading the full
-dependency tree). At batch=10, cold per-VM drops to 18 MB because V8 shares compiled module
-code across the 10 isolates within that iteration. Warm iterations (where the host process
-has already cached compiled modules) are dramatically cheaper: **~8 MB at batch=10, ~2.4 MB
-at batch=20**.
+| Step | RSS delta | Heap delta |
+| ---- | --------- | ---------- |
+| 0    | 185 MB    | 3.2 MB     |
+| 1    | 146 MB    | 3.5 MB     |
+| 2    | 147 MB    | 1.8 MB     |
+
+Step 0 includes ~40 MB of one-time V8 runtime process startup. Steps 1-2 reflect the true
+incremental per-session cost.
+
+**Incremental per session: ~146 MB RSS / ~3 MB host heap.**
+
+The bulk of the cost (~140 MB) is in the V8 child process, where each session loads the PI
+agent's full JS dependency tree into its own V8 isolate heap. Only ~3-8 MB is on the host
+side (kernel wrappers, WASM Worker threads, IPC state).
 
 #### Comparison
 
-| | Sleep (WASM) | PI SDK (V8) |
+| | Sleep (WASM) | PI Session (V8) |
 |---|---|---|
-| Cold RSS — 1st VM in process | 14 MB | **72 MB** |
-| Cold RSS — batch=10 per-VM | 12 MB | 18 MB |
-| Warm RSS — batch=10 per-VM | 6 MB | 8 MB |
-| Scaling behavior | Linear (independent Workers) | Sub-linear (shared code) |
+| Incremental RSS per VM | ~7 MB | ~146 MB |
+| Host heap per VM | ~0.17 MB | ~3 MB |
 | Minimum sandbox provider | 256 MB | 256 MB |
 
-**Key takeaway:** The first PI VM in a fresh process is expensive (~72 MB) because every
-module must be JIT-compiled. But V8 shares compiled code across isolates, so additional VMs
-in the same process are much cheaper. At batch=10, cold per-VM (18 MB) is already close to
-sleep (12 MB). On warm iterations, both converge to ~6-8 MB per VM. Both are orders of
-magnitude more efficient than traditional sandbox providers (256 MB minimum).
+**Key takeaway:** A minimal WASM-only VM costs ~7 MB. A full PI agent session costs ~146 MB,
+dominated by the V8 isolate heap in the shared Rust child process. The V8 runtime process
+itself is shared (one per host process), so the ~40 MB base cost is amortized across all
+sessions. Both workloads are more memory-efficient than traditional sandbox providers
+(256 MB minimum allocation).
 
 ## Methodology
 
@@ -146,34 +151,33 @@ only happens once per VM lifetime.
 
 ### Memory Per Instance
 
-RSS (Resident Set Size) delta per live VM, measured via `process.memoryUsage().rss` before
-and after spinning up N VMs. Two workloads are tested:
+Uses a **staircase approach** to isolate the true incremental cost per VM:
+
+1. **Warmup**: Create and destroy one throwaway VM to pay all one-time costs (module
+   compilation, JIT warmup, code cache population). This ensures subsequent measurements
+   reflect only per-instance overhead.
+2. **Baseline**: Force GC (two passes, `--expose-gc`) and sample RSS/heap.
+3. **Staircase**: Add VMs one at a time. After each VM is created and its workload started,
+   wait for settle time, force GC, and sample memory. The delta from the previous sample
+   is the incremental cost of that VM.
+4. **Verification**: Before each snapshot, the benchmark asserts that the expected processes
+   are running. For the PI workload, this checks both the pi-acp adapter in the spawn table
+   and the V8 isolate child process (`driver === "node"`) in the kernel process table.
+5. **Teardown**: Dispose all VMs and measure reclaimed RSS.
+
+Two workloads are tested:
 
 - **Sleep** (`--workload=sleep`): Each VM spawns `sleep 99999` to keep the WASM Worker
-  thread alive. Without this, the Worker exits after the command completes and its memory
-  is reclaimed before sampling, understating the true per-VM cost.
-- **PI SDK** (`--workload=pi-sdk`): Each VM dynamically imports the full PI coding agent SDK
-  (`@mariozechner/pi-coding-agent`) in the Node.js V8 runtime. This loads the complete
-  agent dependency tree and keeps the process alive.
+  thread alive. WASM processes run as Worker threads in the host process.
+- **PI** (`--workload=pi`): Each VM creates a full PI agent session via `createSession("pi")`
+  backed by a mock LLM server (llmock). This exercises the complete ACP session lifecycle
+  including the V8 isolate child process.
 
-Each batch size is run in a **separate process** to prevent RSS contamination. When multiple
-batch sizes run in the same process, GC reclaims pages from earlier iterations, causing later
-baselines to be artificially high and deltas artificially low. Separate processes ensure each
-measurement starts from a clean baseline.
-
-GC is forced (two passes, `--expose-gc`) before baseline and after-init measurements to flush
-incremental and concurrent collection phases. A 100ms sleep follows each GC to allow
-finalization. For the PI workload, a 3-second settle time is used after spawn to allow module
-loading to complete.
-
-RSS is a process-wide metric that includes JS-side wrappers, Worker thread stacks, and
-OS-mapped pages beyond the kernel itself. The reported per-VM figure is an **upper bound**
-on the true per-VM cost.
-
-The sleep and PI workloads demonstrate different scaling behaviors: WASM Workers have
-independent memory (each gets its own compiled module instance and thread stack), while
-Node.js V8 isolates share compiled module code across instances. This means Node.js-based
-agents become more memory-efficient at scale.
+**RSS measurement spans the full process tree.** The Node.js V8 runtime runs as a separate
+child process (a Rust binary). `process.memoryUsage().rss` only captures the host process
+and its Worker threads (WASM). To include the V8 child process, the benchmark reads
+`/proc/[pid]/statm` for the host and all descendant PIDs, summing their RSS. This ensures
+the reported numbers reflect the true total memory cost, not just the host side.
 
 Sandbox provider memory comparison uses the **minimum allocatable memory** across popular
 providers (e2b, Daytona, Modal, Cloudflare) as of March 2026. The minimum is **256 MB**
@@ -197,19 +201,19 @@ git clone https://github.com/rivet-dev/agent-os
 cd agent-os && pnpm install
 
 # Run all benchmarks (saves timestamped results to benchmarks/results/)
-cd packages/sandbox
+cd registry/tool/sandbox
 ./benchmarks/run-benchmarks.sh
 
 # Or run individually
-npx tsx benchmarks/echo.bench.ts                                          # cold + warm start
+npx tsx benchmarks/echo.bench.ts                                            # cold + warm start
 
 # Memory with sleep workload (WASM process)
-npx tsx --expose-gc benchmarks/memory.bench.ts                             # all default batch sizes
-npx tsx --expose-gc benchmarks/memory.bench.ts --batch=500                 # single batch size
+npx tsx --expose-gc benchmarks/memory.bench.ts                              # default (5 VMs)
+npx tsx --expose-gc benchmarks/memory.bench.ts --count=1                    # single VM
 
-# Memory with PI SDK workload (V8 isolate)
-npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi-sdk               # all default batch sizes
-npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi-sdk --batch=20    # single batch size
+# Memory with PI session workload (V8 isolate)
+npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi                # default (5 VMs)
+npx tsx --expose-gc benchmarks/memory.bench.ts --workload=pi --count=1      # single VM
 ```
 
 Results will vary by hardware. The numbers above are from the test environment described above.

@@ -44,9 +44,6 @@ importers:
       '@rivet-dev/agent-os-sandbox':
         specifier: link:../../registry/tool/sandbox
         version: link:../../registry/tool/sandbox
-      '@rivet-dev/agent-os-sqlite3':
-        specifier: link:../../registry/software/sqlite3
-        version: link:../../registry/software/sqlite3
       sandbox-agent:
         specifier: ^0.4.2
         version: 0.4.2(zod@3.25.76)
@@ -596,6 +593,9 @@ importers:
         specifier: ^3.25.0
         version: 3.25.76
     devDependencies:
+      '@copilotkit/llmock':
+        specifier: ^1.6.0
+        version: 1.6.0
       '@rivet-dev/agent-os-common':
         specifier: link:../../software/common
         version: link:../../software/common
