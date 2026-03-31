@@ -46,7 +46,7 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Build
-        run: pnpm turbo build --filter='!./registry/software/*' --filter='!@rivet-dev/agent-os-playground' --filter='!@secure-exec/example-doom' --filter='!./examples/*'
+        run: pnpm turbo build --filter='!./registry/software/*' --filter='!@rivet-dev/agent-os-playground' --filter='!./examples/*'
 
       - name: Publish to npm
         run: |
