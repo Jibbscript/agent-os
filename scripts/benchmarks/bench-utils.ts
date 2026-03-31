@@ -62,27 +62,8 @@ export interface Workload {
 export const WORKLOADS: Record<string, Workload> = {
 	sleep: {
 		name: "sleep",
-		description: "Minimal VM with coreutils, running `sleep 99999`",
-		createVm: () => AgentOs.create({ software: [coreutils] }),
-		start: (vm) => {
-			vm.spawn("sleep", ["99999"]);
-		},
-		verify: (vm) => {
-			const procs = vm.listProcesses();
-			const running = procs.filter((p) => p.running);
-			const hasSleep = running.some((p) => p.command === "sleep");
-			if (!hasSleep) {
-				throw new Error(
-					`Expected running 'sleep' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
-				);
-			}
-		},
-		settleMs: 500,
-	},
-	node: {
-		name: "node",
-		description: "VM with an idle Node.js process (setTimeout keepalive)",
-		createVm: () => AgentOs.create({ software: [coreutils] }),
+		description: "Minimal VM with idle Node.js process (setTimeout keepalive)",
+		createVm: () => AgentOs.create(),
 		start: (vm) => {
 			vm.spawn("node", ["-e", "setTimeout(() => {}, 999999999)"], {
 				streamStdin: true,
@@ -97,59 +78,11 @@ export const WORKLOADS: Record<string, Workload> = {
 					`Expected running 'node' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
 				);
 			}
-			const kernelProcs = vm.allProcesses();
-			const v8Proc = kernelProcs.find(
-				(p) => p.driver === "node" && p.status === "running",
-			);
-			if (!v8Proc) {
-				throw new Error(
-					`Expected V8 isolate running, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, status: p.status })))}`,
-				);
-			}
 		},
 		settleMs: 2000,
 	},
-	"pi-import": {
-		name: "pi-import",
-		description:
-			"VM with Node.js process that imports the PI SDK and idles",
-		createVm: () => AgentOs.create({ software: [pi] }),
-		start: (vm) => {
-			vm.spawn(
-				"node",
-				[
-					"-e",
-					'import("@mariozechner/pi-coding-agent").then(() => console.log("loaded")).catch(e => console.error(e.message)); setTimeout(() => {}, 999999999);',
-				],
-				{
-					streamStdin: true,
-					env: { ANTHROPIC_API_KEY: "bench-key" },
-				},
-			);
-		},
-		verify: (vm) => {
-			const procs = vm.listProcesses();
-			const running = procs.filter((p) => p.running);
-			const hasNode = running.some((p) => p.command === "node");
-			if (!hasNode) {
-				throw new Error(
-					`Expected running 'node' process, got: ${JSON.stringify(running.map((p) => p.command))}`,
-				);
-			}
-			const kernelProcs = vm.allProcesses();
-			const v8Proc = kernelProcs.find(
-				(p) => p.driver === "node" && p.status === "running",
-			);
-			if (!v8Proc) {
-				throw new Error(
-					`Expected V8 isolate running, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, status: p.status })))}`,
-				);
-			}
-		},
-		settleMs: 5000,
-	},
-	pi: {
-		name: "pi",
+	"pi-session": {
+		name: "pi-session",
 		description: "VM with PI agent session via createSession",
 		createVm: async () => {
 			const { port } = await ensureLlmock();
@@ -168,32 +101,28 @@ export const WORKLOADS: Record<string, Workload> = {
 			});
 		},
 		verify: (vm) => {
-			// listProcesses() checks the high-level spawn table.
 			const procs = vm.listProcesses();
 			const running = procs.filter((p) => p.running);
-			const hasPiAcp = running.some(
+			const hasPi = running.some(
 				(p) =>
 					p.command === "node" &&
-					p.args.some((a) => a.includes("pi-acp")),
+					p.args.some((a) => a.includes("agent-os-pi")),
 			);
-			if (!hasPiAcp) {
+			if (!hasPi) {
 				throw new Error(
-					`Expected running pi-acp process, got: ${JSON.stringify(running.map((p) => ({ cmd: p.command, args: p.args })))}`,
+					`Expected running agent-os-pi process, got: ${JSON.stringify(running.map((p) => ({ cmd: p.command, args: p.args })))}`,
 				);
 			}
-
-			// allProcesses() checks the kernel process table across all runtimes.
-			// Verify the V8 isolate (node driver) is running the ACP adapter.
 			const kernelProcs = vm.allProcesses();
 			const v8Proc = kernelProcs.find(
 				(p) =>
 					p.driver === "node" &&
 					p.status === "running" &&
-					p.args.some((a) => a.includes("pi-acp")),
+					p.args.some((a) => a.includes("agent-os-pi")),
 			);
 			if (!v8Proc) {
 				throw new Error(
-					`Expected V8 isolate running pi-acp, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, cmd: p.command, status: p.status })))}`,
+					`Expected V8 isolate running agent-os-pi, got: ${JSON.stringify(kernelProcs.map((p) => ({ driver: p.driver, cmd: p.command, status: p.status })))}`,
 				);
 			}
 		},
@@ -211,6 +140,31 @@ export async function createBenchVm(): Promise<AgentOs> {
 	return AgentOs.create({
 		software: [coreutils],
 	});
+}
+
+/**
+ * Create a fresh AgentOS VM with PI software and a ready session.
+ * Measures cold start from AgentOs.create() through createSession() completing
+ * (ACP handshake done, agent ready to accept prompts).
+ */
+export async function createPiSessionVm(): Promise<{
+	vm: AgentOs;
+	coldStartMs: number;
+}> {
+	const { url, port } = await ensureLlmock();
+	const t0 = performance.now();
+	const vm = await AgentOs.create({
+		software: [pi],
+		loopbackExemptPorts: [port],
+	});
+	await vm.createSession("pi", {
+		env: {
+			ANTHROPIC_API_KEY: "bench-key",
+			ANTHROPIC_BASE_URL: url,
+		},
+	});
+	const coldStartMs = performance.now() - t0;
+	return { vm, coldStartMs };
 }
 
 // ── Stats and formatting ────────────────────────────────────────────

@@ -86,14 +86,22 @@ agentOS wraps the kernel and adds: a high-level filesystem/process API, ACP agen
 - Reference `~/sandbox-agent` for ACP integration patterns (how pi-acp is spawned, JSON-RPC protocol, session lifecycle). Do not copy code from it.
 - ACP docs: https://agentclientprotocol.com/get-started/introduction
 - Session design is **agent-agnostic**: each agent type has a config specifying its ACP adapter package and main agent package name
-- Currently configured agents: PI (`pi-acp`), OpenCode (`opencode-ai`). Only PI is tested.
+- Currently configured agents: PI (`@rivet-dev/agent-os-pi`), PI CLI (`@rivet-dev/agent-os-pi-cli`), OpenCode (`opencode-ai`). Only PI is tested.
 - **OpenCode limitation**: OpenCode is a native ELF binary (compiled Go), not Node.js. The `opencode-ai` npm package is a wrapper that spawns the native binary. It cannot run inside the VM because the kernel only supports JS/WASM command execution.
-- `createSession("pi")` spawns the ACP adapter inside the VM, which then spawns the agent
+- `createSession("pi")` spawns the ACP adapter inside the VM, which calls the Pi SDK directly
+
+### Agent Adapter Approaches
+
+Each agent type can have two adapter approaches:
+- **SDK adapter** (default) — Embeds the agent SDK directly via library import (`createAgentSession()`). Lower memory footprint (~100MB less for Pi) because it skips loading CLI/TUI code. Binary: `pi-sdk-acp`. Package: `@rivet-dev/agent-os-pi`. Agent ID: `pi`.
+- **CLI adapter** — Spawns the full agent CLI as a headless subprocess via its ACP adapter (`pi-acp` spawns `pi --mode rpc`). Higher memory overhead but provides full CLI feature set. Binary: `pi-acp`. Package: `@rivet-dev/agent-os-pi-cli`. Agent ID: `pi-cli`.
+
+The `pi` agent type defaults to the SDK adapter for reduced memory overhead. Use `pi-cli` when the full CLI-based ACP adapter is needed.
 
 ### Agent Configs
 
 Each agent type needs:
-- `acpAdapter`: npm package name for the ACP adapter (e.g., `pi-acp`)
+- `acpAdapter`: npm package name for the ACP adapter (e.g., `@rivet-dev/agent-os-pi`)
 - `agentPackage`: npm package name for the underlying agent (e.g., `@mariozechner/pi-coding-agent`)
 - Any environment variables or flags needed
 

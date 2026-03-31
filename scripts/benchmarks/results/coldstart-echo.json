@@ -1,0 +1,20 @@
+{
+  "hardware": {
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
+    "cores": 20,
+    "ram": "62.6 GB",
+    "node": "v24.13.0",
+    "os": "Linux 6.1.0-41-amd64",
+    "arch": "x64"
+  },
+  "workload": "echo",
+  "iterations": 5,
+  "coldStart": {
+    "mean": 38.05,
+    "p50": 37.35,
+    "p95": 41.06,
+    "p99": 41.06,
+    "min": 36.61,
+    "max": 41.06
+  }
+}

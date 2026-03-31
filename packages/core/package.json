@@ -44,6 +44,8 @@
 		"@anthropic-ai/claude-code": "^2.1.86",
 		"@copilotkit/llmock": "^1.6.0",
 		"@mariozechner/pi-coding-agent": "^0.60.0",
+		"@rivet-dev/agent-os-pi": "link:../../registry/agent/pi",
+		"@rivet-dev/agent-os-pi-cli": "link:../../registry/agent/pi-cli",
 		"@rivet-dev/agent-os-codex": "link:../../registry/software/codex",
 		"@rivet-dev/agent-os-coreutils": "link:../../registry/software/coreutils",
 		"@rivet-dev/agent-os-curl": "link:../../registry/software/curl",

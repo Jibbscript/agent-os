@@ -65,7 +65,7 @@ export interface AgentConfig {
 	): Promise<{ args?: string[]; env?: Record<string, string> }>;
 }
 
-export type AgentType = "pi" | "opencode";
+export type AgentType = "pi" | "pi-cli" | "opencode";
 
 export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 	pi: {
@@ -74,6 +74,27 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 		// OS instructions injection: reads /etc/agentos/instructions.md from VM,
 		// passes via --append-system-prompt. User's AGENTS.md/CLAUDE.md at cwd
 		// still loads via PI's directory walk. Zero filesystem writes.
+		prepareInstructions: async (
+			kernel,
+			_cwd,
+			additionalInstructions,
+			opts,
+		) => {
+			const instructions = await readVmInstructions(
+				kernel,
+				additionalInstructions,
+				opts?.toolReference,
+				opts?.skipBase,
+			);
+			if (!instructions) return {};
+			return { args: ["--append-system-prompt", instructions] };
+		},
+	},
+	"pi-cli": {
+		acpAdapter: "pi-acp",
+		agentPackage: "@mariozechner/pi-coding-agent",
+		// Full CLI-based ACP adapter: spawns pi --mode rpc as a subprocess.
+		// Higher memory overhead but provides full CLI feature set.
 		prepareInstructions: async (
 			kernel,
 			_cwd,

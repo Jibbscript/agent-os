@@ -5,15 +5,21 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = resolve(__dirname, "..");
 
-const pi = defineSoftware({
-	name: "pi",
+const piCli = defineSoftware({
+	name: "pi-cli",
 	type: "agent" as const,
 	packageDir,
-	requires: ["@mariozechner/pi-coding-agent"],
+	requires: ["pi-acp", "@mariozechner/pi-coding-agent"],
 	agent: {
-		id: "pi",
-		acpAdapter: "@rivet-dev/agent-os-pi",
+		id: "pi-cli",
+		acpAdapter: "pi-acp",
 		agentPackage: "@mariozechner/pi-coding-agent",
+		env: (ctx) => ({
+			PI_ACP_PI_COMMAND: ctx.resolveBin(
+				"@mariozechner/pi-coding-agent",
+				"pi",
+			),
+		}),
 		prepareInstructions: async (kernel, _cwd, additionalInstructions, opts) => {
 			const parts: string[] = [];
 			if (!opts?.skipBase) {
@@ -30,4 +36,4 @@ const pi = defineSoftware({
 	},
 });
 
-export default pi;
+export default piCli;

@@ -14,6 +14,18 @@ importers:
       '@biomejs/biome':
         specifier: ^2.3
         version: 2.4.10
+      '@copilotkit/llmock':
+        specifier: ^1.6.0
+        version: 1.6.0
+      '@rivet-dev/agent-os-common':
+        specifier: workspace:*
+        version: link:registry/software/common
+      '@rivet-dev/agent-os-core':
+        specifier: workspace:*
+        version: link:packages/core
+      '@rivet-dev/agent-os-pi':
+        specifier: workspace:*
+        version: link:registry/agent/pi
       '@types/node':
         specifier: ^22.19.15
         version: 22.19.15
@@ -130,6 +142,12 @@ importers:
       '@rivet-dev/agent-os-jq':
         specifier: link:../../registry/software/jq
         version: link:../../registry/software/jq
+      '@rivet-dev/agent-os-pi':
+        specifier: link:../../registry/agent/pi
+        version: link:../../registry/agent/pi
+      '@rivet-dev/agent-os-pi-cli':
+        specifier: link:../../registry/agent/pi-cli
+        version: link:../../registry/agent/pi-cli
       '@rivet-dev/agent-os-ripgrep':
         specifier: link:../../registry/software/ripgrep
         version: link:../../registry/software/ripgrep
@@ -193,6 +211,28 @@ importers:
         version: 5.9.3
 
   registry/agent/pi:
+    dependencies:
+      '@agentclientprotocol/sdk':
+        specifier: ^0.16.1
+        version: 0.16.1(zod@3.25.76)
+      '@mariozechner/pi-ai':
+        specifier: ^0.60.0
+        version: 0.60.0(ws@8.20.0)(zod@3.25.76)
+      '@mariozechner/pi-coding-agent':
+        specifier: ^0.60.0
+        version: 0.60.0(ws@8.20.0)(zod@3.25.76)
+      '@rivet-dev/agent-os-core':
+        specifier: workspace:*
+        version: link:../../../packages/core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  registry/agent/pi-cli:
     dependencies:
       '@mariozechner/pi-coding-agent':
         specifier: ^0.60.0

@@ -1,0 +1,44 @@
+{
+  "hardware": {
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
+    "cores": 20,
+    "ram": "62.6 GB",
+    "node": "v24.13.0",
+    "os": "Linux 6.1.0-41-amd64",
+    "arch": "x64"
+  },
+  "result": {
+    "workload": "sleep",
+    "count": 5,
+    "steps": [
+      {
+        "stepIndex": 0,
+        "rssBytes": 42618880,
+        "heapBytes": 616752
+      },
+      {
+        "stepIndex": 1,
+        "rssBytes": 18022400,
+        "heapBytes": 453424
+      },
+      {
+        "stepIndex": 2,
+        "rssBytes": 17969152,
+        "heapBytes": 408568
+      },
+      {
+        "stepIndex": 3,
+        "rssBytes": 18173952,
+        "heapBytes": 485264
+      },
+      {
+        "stepIndex": 4,
+        "rssBytes": 19017728,
+        "heapBytes": 416440
+      }
+    ],
+    "avgPerVmRssBytes": 23160422,
+    "avgPerVmHeapBytes": 476090,
+    "reclaimedRssBytes": 113549312
+  }
+}
